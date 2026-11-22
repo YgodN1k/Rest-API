@@ -14,13 +14,18 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"rastapi/internal/auth"
 	"rastapi/internal/config"
 	"rastapi/internal/db"
 	"rastapi/internal/health"
 	"rastapi/internal/httpx"
+	"rastapi/internal/users"
 )
 
-const shutdownTimeout = 10 * time.Second
+const (
+	shutdownTimeout = 10 * time.Second
+	tokenTTL        = 15 * time.Minute
+)
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -50,9 +55,15 @@ func run(log *slog.Logger) error {
 	defer pool.Close()
 	log.Info("connected to database")
 
+	tokens := auth.NewTokens(cfg.JWTSecret, tokenTTL)
+	usersHandler, err := users.NewHandler(users.NewRepo(pool), tokens)
+	if err != nil {
+		return fmt.Errorf("init users handler: %w", err)
+	}
+
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           newRouter(log, pool),
+		Handler:           newRouter(log, pool, usersHandler),
 		ReadTimeout:       10 * time.Second,
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -93,13 +104,16 @@ func run(log *slog.Logger) error {
 	return nil
 }
 
-func newRouter(log *slog.Logger, pool *pgxpool.Pool) http.Handler {
+func newRouter(log *slog.Logger, pool *pgxpool.Pool, usersHandler *users.Handler) http.Handler {
 	r := chi.NewRouter()
 	r.Use(httpx.RequestID(log))
 	r.Use(httpx.Logger)
 	r.Use(httpx.Recoverer)
 
 	r.Get("/healthz", health.Handler(pool))
+
+	r.Post("/auth/register", usersHandler.Register)
+	r.Post("/auth/login", usersHandler.Login)
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, r, http.StatusNotFound, "not found")
